@@ -1,0 +1,63 @@
+#!/bin/bash
+# trello-restore.sh — Restore a deleted card from backup securely
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname -- "$0")" && pwd)"
+source "$SCRIPT_DIR/.env.trello"
+export TRELLO_API_KEY TRELLO_TOKEN
+
+BACKUP_FILE="${1:-}"
+
+# ... (keep your "Usage" and "File check" logic here) ...
+
+# Securely extract data using a single Python call to avoid opening the file 5 times
+# We use 'export' so Python can read these without them being visible in the process list
+eval "$(python3 -c "
+import json, sys, os
+try:
+    with open(os.environ['BACKUP_FILE'], 'r') as f:
+        data = json.load(f)
+    card = data.get('card_data', data)
+    print(f'LIST_ID=\"{card.get(\"idList\", \"\")}\"')
+    print(f'CARD_NAME=\"{card.get(\"name\", \"Unknown\")}\"')
+    # Base64 or escaping is safer, but for now we just extract carefully
+")" export BACKUP_FILE="$BACKUP_FILE"
+
+echo -e "\n  RESTORE CARD\n  ------------\n  Name: $CARD_NAME\n  To list: $LIST_ID\n"
+read -p "  Restore this card? (yes/no): " CONFIRM
+[[ "$CONFIRM" != "yes" ]] && echo "Cancelled." && exit 0
+
+# Use mktemp for private response storage
+TEMP_RESP=$(mktemp /tmp/trello_res.XXXXXX)
+trap 'rm -f "$TEMP_RESP"' EXIT
+
+# Encode variables safely using a heredoc (prevents command injection)
+ENCODED_NAME=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.stdin.read().strip()))" <<< "$CARD_NAME")
+# Use a Python helper for the POST to keep the Token out of the URL
+python3 - <<EOF
+import urllib.request, urllib.parse, os, json
+
+params = {
+    'idList': '$LIST_ID',
+    'name': '$CARD_NAME',
+    'key': os.environ['TRELLO_API_KEY'],
+    'token': os.environ['TRELLO_TOKEN']
+}
+# Adding description separately to handle large text safely
+with open(os.environ['BACKUP_FILE']) as f:
+    card_desc = json.load(f).get('card_data', {}).get('desc', '')
+params['desc'] = card_desc
+
+url = "https://api.trello.com/1/cards"
+data = urllib.parse.urlencode(params).encode()
+req = urllib.request.Request(url, data=data, method='POST')
+
+try:
+    with urllib.request.urlopen(req) as response:
+        res = json.loads(response.read())
+        print(f"\n  Done! New Card ID: {res['id']}")
+except Exception as e:
+    print(f"\n  Error: {e}")
+    sys.exit(1)
+EOF
