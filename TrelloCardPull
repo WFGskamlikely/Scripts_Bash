@@ -1,0 +1,126 @@
+#!/bin/bash
+# trello-cards.sh — Select a board, view its cards
+# Usage: ./trello-cards.sh
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname -- "$0")" && pwd)"
+source "$SCRIPT_DIR/.env.trello"
+
+# Export secrets to environment so Python can read them securely 
+# (This prevents them from appearing in 'ps' or process logs)
+export TRELLO_API_KEY TRELLO_TOKEN
+
+MAX_RETRIES=3
+RETRY_DELAY=5
+
+# Use a secure temp file that only the current user can read
+TEMP_RESP=$(mktemp /tmp/trello_resp.XXXXXX)
+trap 'rm -f "$TEMP_RESP"' EXIT
+
+api_get() {
+    local ENDPOINT="$1"
+    local ATTEMPT=0
+    local SEP="?"
+    [[ "$ENDPOINT" == *"?"* ]] && SEP="&"
+    
+    while [ $ATTEMPT -lt $MAX_RETRIES ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        HTTP_CODE=$(curl -s -o "$TEMP_RESP" -w "%{http_code}" \
+            "https://api.trello.com{ENDPOINT}${SEP}key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}")
+        if [ "$HTTP_CODE" = "200" ]; then
+            cat "$TEMP_RESP"
+            return 0
+        elif [ "$HTTP_CODE" = "429" ]; then
+            sleep "$RETRY_DELAY"
+        else
+            return 1
+        fi
+    done
+    return 1
+}
+
+# Load boards from env
+BOARD_LABELS=()
+BOARD_IDS=()
+while IFS='=' read -r KEY VAL; do
+    BOARD_LABELS+=("${KEY#TRELLO_BOARD_}")
+    BOARD_IDS+=("$VAL")
+done < <(grep "^TRELLO_BOARD_" "$SCRIPT_DIR/.env.trello")
+
+echo -e "\n  YOUR BOARDS\n  -----------"
+for i in "${!BOARD_LABELS[@]}"; do
+    BNAME=$(api_get "/boards/${BOARD_IDS[$i]}?fields=name" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('name', 'Unknown'))" 2>/dev/null || echo "${BOARD_LABELS[$i]}")
+    echo "  $((i+1)). $BNAME"
+done
+
+echo ""
+read -p "  Select board (1-${#BOARD_IDS[@]}): " CHOICE
+
+if ! [[ "$CHOICE" =~ ^[0-9]+$ ]] || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "${#BOARD_IDS[@]}" ]; then
+    echo "  Invalid selection."
+    exit 1
+fi
+
+SELECTED_ID="${BOARD_IDS[$((CHOICE-1))]}"
+export SELECTED_ID
+
+echo ""
+api_get "/boards/$SELECTED_ID/lists?cards=all&card_fields=name,due,labels,shortUrl,idMembers" 2>/dev/null | python3 -c "
+import sys, json, os, urllib.request
+from datetime import datetime
+
+# ACCESS SECRETS VIA ENV VARS (SECURE)
+key = os.environ.get('TRELLO_API_KEY')
+token = os.environ.get('TRELLO_TOKEN')
+board_id = os.environ.get('SELECTED_ID')
+
+data = json.load(sys.stdin)
+members = {}
+
+# Fetch board members using secrets from env
+try:
+    url = f'https://api.trello.com{board_id}/members?key={key}&token={token}&fields=fullName,username'
+    with urllib.request.urlopen(url) as resp:
+        for m in json.loads(resp.read()):
+            members[m['id']] = m.get('fullName', m.get('username', ''))
+except Exception:
+    pass
+
+rows = []
+for lst in data:
+    for c in lst.get('cards', []):
+        due = '--'
+        if c.get('due'):
+            try:
+                d = datetime.fromisoformat(c['due'].replace('Z','+00:00'))
+                due = d.strftime('%b %d')
+            except: pass
+            
+        labels = '--'
+        if c.get('labels'):
+            ll = [l['name'] for l in c['labels'] if l.get('name')]
+            if ll: labels = ', '.join(ll)
+            
+        assigned = '--'
+        if c.get('idMembers'):
+            names = [members.get(mid, mid[:8]) for mid in c['idMembers']]
+            assigned = ', '.join(names)
+            
+        name = c['name'][:37] + '...' if len(c['name']) > 40 else c['name']
+        card_id = c['shortUrl'].split('/')[-1] if c.get('shortUrl') else c['id'][:8]
+        rows.append((lst['name'], card_id, name, assigned, due, labels))
+
+if not rows:
+    print('  No cards found.')
+    sys.exit(0)
+
+headers = ('LIST', 'ID', 'CARD', 'ASSIGNED', 'DUE', 'LABELS')
+widths = [max(len(headers[i]), max((len(str(r[i])) for r in rows), default=0)) for i in range(6)]
+fmt = '  ' + '  '.join([f'{{:<{w}}}' for w in widths])
+
+print(fmt.format(*headers))
+print('  ' + '  '.join(['-' * w for w in widths]))
+for r in rows:
+    print(fmt.format(*r))
+"
