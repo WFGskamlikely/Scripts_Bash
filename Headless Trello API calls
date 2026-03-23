@@ -186,3 +186,6 @@ api_post "/cards/$CARD_ID/idMembers?value=$MEMBER_ID" > /dev/null 2>&1
 echo ""
 echo "  Done. $MEMBER_NAME assigned to \"$CARD_NAME\""
 echo ""
+
+
+#####Updated internal 
