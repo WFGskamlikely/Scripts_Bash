@@ -1,0 +1,188 @@
+#!/bin/bash
+# trello-assign.sh — Assign a member to a card
+# Interactive: select board → select card → select member → assign
+# Usage: ./trello-assign.sh
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname -- "$0")" && pwd)"
+source "$SCRIPT_DIR/.env.trello"
+
+MAX_RETRIES=3
+RETRY_DELAY=5
+
+api_get() {
+    local ENDPOINT="$1"
+    local ATTEMPT=0
+    local SEP="?"
+    if [[ "$ENDPOINT" == *"?"* ]]; then
+        SEP="&"
+    fi
+    while [ $ATTEMPT -lt $MAX_RETRIES ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        HTTP_CODE=$(curl -s -o /tmp/trello_resp.json -w "%{http_code}" \
+            "https://api.trello.com/1${ENDPOINT}${SEP}key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}")
+        if [ "$HTTP_CODE" = "200" ]; then
+            cat /tmp/trello_resp.json
+            return 0
+        elif [ "$HTTP_CODE" = "429" ]; then
+            sleep "$RETRY_DELAY"
+        else
+            return 1
+        fi
+    done
+    return 1
+}
+
+api_post() {
+    local ENDPOINT="$1"
+    local ATTEMPT=0
+    local SEP="?"
+    if [[ "$ENDPOINT" == *"?"* ]]; then
+        SEP="&"
+    fi
+    while [ $ATTEMPT -lt $MAX_RETRIES ]; do
+        ATTEMPT=$((ATTEMPT + 1))
+        HTTP_CODE=$(curl -s -o /tmp/trello_resp.json -w "%{http_code}" \
+            -X POST \
+            "https://api.trello.com/1${ENDPOINT}${SEP}key=${TRELLO_API_KEY}&token=${TRELLO_TOKEN}")
+        if [ "$HTTP_CODE" = "200" ]; then
+            cat /tmp/trello_resp.json
+            return 0
+        elif [ "$HTTP_CODE" = "429" ]; then
+            sleep "$RETRY_DELAY"
+        else
+            return 1
+        fi
+    done
+    return 1
+}
+
+# Step 1: Select board
+BOARD_LABELS=()
+BOARD_IDS=()
+while IFS='=' read -r KEY VAL; do
+    BOARD_LABELS+=("${KEY#TRELLO_BOARD_}")
+    BOARD_IDS+=("$VAL")
+done < <(grep "^TRELLO_BOARD_" "$SCRIPT_DIR/.env.trello")
+
+echo ""
+echo "  SELECT BOARD"
+echo "  ------------"
+for i in "${!BOARD_LABELS[@]}"; do
+    BNAME=$(api_get "/boards/${BOARD_IDS[$i]}?fields=name" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin)['name'])" 2>/dev/null || echo "${BOARD_LABELS[$i]}")
+    echo "  $((i+1)). $BNAME"
+done
+echo ""
+read -p "  Select board (1-${#BOARD_IDS[@]}): " BCHOICE
+
+if ! [[ "$BCHOICE" =~ ^[0-9]+$ ]] || [ "$BCHOICE" -lt 1 ] || [ "$BCHOICE" -gt "${#BOARD_IDS[@]}" ]; then
+    echo "  Invalid selection."
+    exit 1
+fi
+
+BOARD_ID="${BOARD_IDS[$((BCHOICE-1))]}"
+
+# Step 2: Show cards, pick one
+echo ""
+echo "  CARDS ON BOARD"
+echo "  --------------"
+
+CARD_IDS=()
+CARD_NAMES=()
+
+eval "$(api_get "/boards/$BOARD_ID/lists?cards=all&card_fields=name,idMembers" 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+idx = 1
+for lst in data:
+    for c in lst.get('cards', []):
+        name = c['name']
+        if len(name) > 50:
+            name = name[:47] + '...'
+        print(f'CARD_IDS+=(\"{c[\"id\"]}\")')
+        print(f'CARD_NAMES+=(\"{name}\")')
+        members = ', '.join(c.get('idMembers', [])) if c.get('idMembers') else 'none'
+        print(f'echo \"  {idx}. [{lst[\"name\"]}] {name}\"')
+        idx += 1
+")"
+
+if [ ${#CARD_IDS[@]} -eq 0 ]; then
+    echo "  No cards found."
+    exit 0
+fi
+
+echo ""
+read -p "  Select card (1-${#CARD_IDS[@]}): " CCHOICE
+
+if ! [[ "$CCHOICE" =~ ^[0-9]+$ ]] || [ "$CCHOICE" -lt 1 ] || [ "$CCHOICE" -gt "${#CARD_IDS[@]}" ]; then
+    echo "  Invalid selection."
+    exit 1
+fi
+
+CARD_ID="${CARD_IDS[$((CCHOICE-1))]}"
+CARD_NAME="${CARD_NAMES[$((CCHOICE-1))]}"
+
+# Step 3: Show current assignment
+echo ""
+CURRENT=$(api_get "/cards/$CARD_ID/members?fields=fullName,username" 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+if data:
+    for m in data:
+        print(f'    - {m[\"fullName\"]} (@{m[\"username\"]})')
+else:
+    print('    (nobody)')
+" 2>/dev/null || echo "    (unknown)")
+
+echo "  Currently assigned to:"
+echo "$CURRENT"
+
+# Step 4: Show available members on the board
+echo ""
+echo "  BOARD MEMBERS"
+echo "  -------------"
+
+MEMBER_IDS=()
+MEMBER_NAMES=()
+
+eval "$(api_get "/boards/$BOARD_ID/members?fields=fullName,username" 2>/dev/null | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for i, m in enumerate(data):
+    print(f'MEMBER_IDS+=(\"{m[\"id\"]}\")')
+    print(f'MEMBER_NAMES+=(\"{m[\"fullName\"]}\")')
+    print(f'echo \"  {i+1}. {m[\"fullName\"]} (@{m[\"username\"]})\"')
+")"
+
+if [ ${#MEMBER_IDS[@]} -eq 0 ]; then
+    echo "  No members found on this board."
+    exit 1
+fi
+
+echo ""
+read -p "  Assign to (1-${#MEMBER_IDS[@]}): " MCHOICE
+
+if ! [[ "$MCHOICE" =~ ^[0-9]+$ ]] || [ "$MCHOICE" -lt 1 ] || [ "$MCHOICE" -gt "${#MEMBER_IDS[@]}" ]; then
+    echo "  Invalid selection."
+    exit 1
+fi
+
+MEMBER_ID="${MEMBER_IDS[$((MCHOICE-1))]}"
+MEMBER_NAME="${MEMBER_NAMES[$((MCHOICE-1))]}"
+
+# Step 5: Confirm and assign
+echo ""
+echo "  Assign \"$CARD_NAME\" to $MEMBER_NAME?"
+read -p "  Confirm (yes/no): " CONFIRM
+
+if [ "$CONFIRM" != "yes" ]; then
+    echo "  Cancelled."
+    exit 0
+fi
+
+api_post "/cards/$CARD_ID/idMembers?value=$MEMBER_ID" > /dev/null 2>&1
+
+echo ""
+echo "  Done. $MEMBER_NAME assigned to \"$CARD_NAME\""
+echo ""
